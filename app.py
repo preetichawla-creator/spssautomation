@@ -1,126 +1,95 @@
 """
-Streamlit app: Lighthouse Studio (.sav export) -> SPSS mapping & syntax automation.
+Streamlit app for the SPSS mapping-file generator.
 
-RUN WITH:
+Run with:
     streamlit run app.py
 
-(Do NOT run this with `python app.py` — Streamlit apps must be launched via
-the `streamlit run` command so the Streamlit server/UI framework starts.)
+Requires generate_mapping.py to be in the same folder — this app is just a
+UI wrapper around its build_workbook() function; all the actual parsing/
+renaming/labeling logic lives there and is unchanged.
 """
-
 import io
-import os
 import tempfile
+from pathlib import Path
 
+import pandas as pd
 import streamlit as st
-import openpyxl
+from openpyxl import load_workbook
 
-from lighthouse_core import build_mapping_workbook, build_syntax_text
+from generate_mapping import build_workbook
 
-st.set_page_config(page_title="Lighthouse → SPSS Automation", layout="wide")
+st.set_page_config(page_title="SPSS Mapping File Generator", layout="wide")
 
-st.title("Lighthouse Studio → SPSS Mapping & Syntax Automation")
+st.title("SPSS Mapping File Generator")
 st.caption(
-    "Stage 1 turns a raw .sav export into a review-ready mapping file. "
-    "Stage 2 turns the finalized mapping into ready-to-run SPSS syntax."
+    "Upload a raw .sav data file and the Word questionnaire for the same study "
+    "to get a draft Variable Label / Value Label mapping file."
 )
 
-tab1, tab2 = st.tabs(["Stage 1 — Generate Mapping", "Stage 2 — Generate Syntax"])
+col1, col2 = st.columns(2)
+with col1:
+    sav_file = st.file_uploader("Raw data file (.sav)", type=["sav"])
+with col2:
+    qnr_file = st.file_uploader("Questionnaire (.docx)", type=["docx"])
 
-# ---------------------------------------------------------------------------
-# STAGE 1
-# ---------------------------------------------------------------------------
-with tab1:
-    st.subheader("1. Upload your raw .sav export")
-    sav_file = st.file_uploader("Lighthouse SPSS export (.sav)", type=["sav"], key="sav_stage1")
+generate = st.button("Generate mapping file", type="primary", disabled=not (sav_file and qnr_file))
 
-    st.subheader("2. Optional: codebook for per-option grid text")
-    st.caption(
-        "Two columns: Variable, Option Text. Only needed for grid/multi-select "
-        "items where Lighthouse's .sav export doesn't include the specific "
-        "answer-option wording."
+if generate:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sav_path = Path(tmpdir) / sav_file.name
+        qnr_path = Path(tmpdir) / qnr_file.name
+        sav_path.write_bytes(sav_file.getvalue())
+        qnr_path.write_bytes(qnr_file.getvalue())
+
+        with st.spinner("Parsing questionnaire and raw data, building mapping..."):
+            try:
+                wb = build_workbook(str(sav_path), str(qnr_path))
+            except Exception as e:
+                st.error(f"Failed to generate mapping: {e}")
+                st.stop()
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        st.session_state["mapping_bytes"] = buf.getvalue()
+        st.session_state["mapping_ready"] = True
+
+if st.session_state.get("mapping_ready"):
+    st.success("Mapping file generated.")
+
+    st.download_button(
+        "Download mapping .xlsx",
+        data=st.session_state["mapping_bytes"],
+        file_name="draft_mapping.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    codebook_file = st.file_uploader("Codebook (.xlsx)", type=["xlsx"], key="codebook_stage1")
 
-    if sav_file is not None:
-        if st.button("Generate mapping file", type="primary"):
-            with st.spinner("Reading .sav and applying rename/label rules..."):
-                # pyreadstat needs a real file path, so write the upload to a temp file
-                with tempfile.NamedTemporaryFile(suffix=".sav", delete=False) as tmp_sav:
-                    tmp_sav.write(sav_file.getvalue())
-                    sav_path = tmp_sav.name
+    wb_preview = load_workbook(io.BytesIO(st.session_state["mapping_bytes"]), read_only=True)
 
-                codebook_arg = None
-                if codebook_file is not None:
-                    codebook_arg = io.BytesIO(codebook_file.getvalue())
+    ws = wb_preview["Variable Label"]
+    rows = list(ws.iter_rows(values_only=True))
+    df = pd.DataFrame(rows[2:], columns=rows[1])  # skip title row, use header row
 
-                try:
-                    wb, stats = build_mapping_workbook(sav_path, codebook_path=codebook_arg)
-                finally:
-                    os.unlink(sav_path)
+    total = len(df)
+    flagged = df["Notes"].apply(lambda x: bool(x)).sum()
 
-            st.success("Mapping file generated.")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total variables", stats["total"])
-            c2.metric("Excluded (helper vars)", stats["excluded"])
-            c3.metric("Auto-resolved", stats["auto_resolved"])
-            c4.metric("Flagged for review", stats["flagged"])
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total variables", total)
+    m2.metric("Flagged for review", flagged)
+    m3.metric("Auto-resolved", total - flagged)
 
-            buf = io.BytesIO()
-            wb.save(buf)
-            buf.seek(0)
+    tab1, tab2 = st.tabs(["Flagged rows (review these first)", "All variables"])
 
-            st.download_button(
-                label="Download mapping .xlsx",
-                data=buf,
-                file_name="mapping_file.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            st.info(
-                "Review the yellow-highlighted rows in the downloaded file, fix any "
-                "'Suggested Rename' / 'Cleaned Variable Label' values that need it, "
-                "then use that file in Stage 2."
-            )
+    with tab1:
+        flagged_df = df[df["Notes"].astype(bool)]
+        st.dataframe(flagged_df, use_container_width=True, height=500)
 
-# ---------------------------------------------------------------------------
-# STAGE 2
-# ---------------------------------------------------------------------------
-with tab2:
-    st.subheader("1. Upload your finalized mapping file")
-    mapping_file = st.file_uploader("Finalized mapping (.xlsx)", type=["xlsx"], key="mapping_stage2")
+    with tab2:
+        st.dataframe(df, use_container_width=True, height=500)
 
-    st.subheader("2. Upload the original .sav (for value labels)")
-    sav_file2 = st.file_uploader("Original .sav export", type=["sav"], key="sav_stage2")
-
-    if mapping_file is not None and sav_file2 is not None:
-        if st.button("Generate SPSS syntax", type="primary"):
-            with st.spinner("Building .sps syntax..."):
-                with tempfile.NamedTemporaryFile(suffix=".sav", delete=False) as tmp_sav:
-                    tmp_sav.write(sav_file2.getvalue())
-                    sav_path = tmp_sav.name
-
-                wb = openpyxl.load_workbook(io.BytesIO(mapping_file.getvalue()), data_only=True)
-
-                try:
-                    syntax_text, stats = build_syntax_text(wb, sav_path)
-                except ValueError as e:
-                    st.error(str(e))
-                    syntax_text = None
-                finally:
-                    os.unlink(sav_path)
-
-            if syntax_text:
-                st.success("Syntax generated.")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Variables renamed", stats["renamed"])
-                c2.metric("Variable labels written", stats["labeled"])
-                c3.metric("Variables with value labels", stats["value_labeled"])
-
-                st.download_button(
-                    label="Download .sps syntax",
-                    data=syntax_text,
-                    file_name="generated_syntax.sps",
-                    mime="text/plain",
-                )
-                with st.expander("Preview syntax"):
-                    st.code(syntax_text, language=None)
+    with st.expander("Value Label sheet preview"):
+        ws2 = wb_preview["Value Label"]
+        rows2 = list(ws2.iter_rows(values_only=True))
+        df2 = pd.DataFrame(rows2[2:], columns=rows2[1])
+        st.dataframe(df2, use_container_width=True, height=400)
