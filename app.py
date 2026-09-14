@@ -72,7 +72,8 @@ if st.session_state.get("mapping_ready"):
     df = pd.DataFrame(rows[2:], columns=rows[1])  # skip title row, use header row
 
     total = len(df)
-    flagged = df["Notes"].apply(lambda x: bool(x)).sum()
+    has_note = df["Notes"].fillna("") != ""
+    flagged = int(has_note.sum())
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Total variables", total)
@@ -82,14 +83,14 @@ if st.session_state.get("mapping_ready"):
     tab1, tab2 = st.tabs(["Flagged rows (review these first)", "All variables"])
 
     with tab1:
-        flagged_df = df[df["Notes"].astype(bool)]
-        st.dataframe(flagged_df, use_container_width=True, height=500)
+        flagged_df = df[has_note]
+        st.dataframe(flagged_df, width="stretch", height=500)
 
     with tab2:
-        st.dataframe(df, use_container_width=True, height=500)
+        st.dataframe(df, width="stretch", height=500)
 
     with st.expander("Value Label sheet preview"):
         ws2 = wb_preview["Value Label"]
         rows2 = list(ws2.iter_rows(values_only=True))
         df2 = pd.DataFrame(rows2[2:], columns=rows2[1])
-        st.dataframe(df2, use_container_width=True, height=400)
+        st.dataframe(df2, width="stretch", height=400)
