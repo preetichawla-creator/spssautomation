@@ -50,6 +50,7 @@ from docx import Document
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 # ----------------------------------------------------------------------------
 # Maintained lookup for platform system fields. These don't vary by study, so
@@ -76,34 +77,51 @@ NON_LATIN_RE = re.compile(
 
 LABEL_CHAR_LIMIT = 250
 
-# Survey-programming/interviewer instructions that carry no respondent-facing meaning
-# and should never end up in a label, even when they aren't bracket-wrapped (e.g. an
-# "(SR)"/"(MR)" tag right after the question text). Matched case-insensitively.
-# Deliberately narrow: bracketed instructions ([Please select only one answer], [If
-# A1=1], etc.) are already removed wholesale by the [...] strip below, so this only
-# needs to cover the same kind of tag when it AREN'T bracket-wrapped -- broader
-# phrase-matching here risks deleting genuine question text that happens to share
-# wording with an instruction (e.g. a question that itself asks the respondent to
-# "select the language").
+# A single item's own text is capped well under the label limit -- an item that's a full
+# paragraph (e.g. "do you agree with this statement: <200 words>") would otherwise starve
+# the parent question of any room at all once " : {item}" is appended. Leaves a comfortable
+# floor for the parent text even in the worst case.
+MAX_ITEM_TEXT_CHARS = 120
+
+# Survey-programming/interviewer instructions that carry no respondent-facing meaning.
+# Bracketed/parenthesized instructions ("[If A1=1]", "(Please select only one answer)",
+# "(SR)"/"(MR)" tags) are removed wholesale by the [...] and (...) strips in clean_text
+# below, per explicit instruction to drop all bracket/paren content from labels. This
+# pattern only needs to catch the same kind of tag when it ISN'T bracket-wrapped.
 INSTRUCTION_PHRASES_RE = re.compile(
-    r'\(\s*\b(SR|MR|SA|MA)\s*\)'                                    # (SR)/(MR)/etc. -- only when parenthesized, since bare 2-letter tokens are too easy to collide with real content (e.g. "SA" = South Africa)
-    r'|\(?\s*\b(single\s*[- ]?\s*(answer|code|coding|response)'
+    r'\b(single\s*[- ]?\s*(answer|code|coding|response)'
     r'|multi(ple)?\s*[- ]?\s*(option|response|coding|answer|code)s?'
-    r'|check\s*box)\b\s*\)?',
+    r'|check\s*box'
+    r'|#?options?\s+[\d\-–\s]*(are\s+)?(randomly\s+)?(distributed|shown\s+in\s+(random|fixed)\s+order))\b',
     re.IGNORECASE
 )
 
 
 def clean_text(text):
-    """Strip survey-programming markup (<...>, [...], [%...%]), interviewer/routing
-    instructions, and any non-Latin-script translation text, then collapse whatever
-    whitespace/punctuation that leaves behind."""
+    """Strip survey-programming markup (<...>, [...], (...)), interviewer/routing
+    instructions, leading bullet/checkbox glyphs, blank-fill underscore runs, and any
+    non-Latin-script translation text, then collapse whatever whitespace/punctuation
+    that leaves behind. Deliberately keeps '?' intact -- callers comparing candidate
+    question text (see maybe_update_question_text) rely on it; '?' -> '.' is applied
+    once, at final label assembly, by finalize() in rename_and_label."""
     if not text:
         return ''
-    cleaned = re.sub(r'<[^>]*>', '', text)
+    # normalize fullwidth CJK punctuation to its ASCII equivalent -- this document mixes
+    # both inconsistently (e.g. "Gender：" vs "Gender:"), and downstream regexes here are
+    # all written against ASCII punctuation
+    cleaned = text.translate(str.maketrans('（）：；，？', '():;,?'))
+    cleaned = cleaned.translate(str.maketrans('', '', '"“”„‟'))   # drop all double-quote variants
+    cleaned = re.sub(r'<[^>]*>', '', cleaned)
     cleaned = re.sub(r'\[[^\]]*\]', '', cleaned)   # covers [%...%] too, being a superset
+    cleaned = re.sub(r'\([^)]*\)', '', cleaned)    # parenthetical content is never wanted in a label
     cleaned = INSTRUCTION_PHRASES_RE.sub('', cleaned)
     cleaned = NON_LATIN_RE.sub('', cleaned)
+    cleaned = re.sub(r'_{3,}', '', cleaned)        # blank-fill-in underscore runs, e.g. "First____" -> "First"
+    # leading UI marker glyphs (radio-button/checkbox bullets, a stray '#' programmer-note
+    # marker, or a "(1)"/"(2)" style item-position marker) carry no content of their own.
+    cleaned = re.sub(r'^[○□●■◯•]+\s*', '', cleaned)
+    cleaned = re.sub(r'^\(\d+\)\s*', '', cleaned)
+    cleaned = re.sub(r'^#+\s*', '', cleaned)
     cleaned = re.sub(r'[\(\[]\s*[\)\]]', '', cleaned)          # empty () or [] left behind
     cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
     # drop trailing whitespace-separated tokens that are pure punctuation — these are
@@ -112,7 +130,7 @@ def clean_text(text):
     while tokens and re.fullmatch(r'[^\w]+', tokens[-1] or ''):
         tokens.pop()
     cleaned = ' '.join(tokens)
-    return cleaned.strip(' /|-,.')
+    return cleaned.strip(' /|-,')
 
 
 def truncate_label(text, limit=LABEL_CHAR_LIMIT):
@@ -130,7 +148,11 @@ def compose_with_suffix(base, suffix, limit=LABEL_CHAR_LIMIT):
     """Join base+suffix, shortening `base` (not the suffix) if needed so the
     item-specific suffix — the part that actually distinguishes this variable
     from its siblings — always survives, rather than being the first thing lost
-    to truncation."""
+    to truncation. When the suffix is our " : "-style separator, a trailing "?"
+    or "." on base is dropped first -- otherwise "...year? : First" turns into
+    the doubled-up "...year. : First" once "?" becomes "." at final assembly."""
+    if suffix.lstrip().startswith(':'):
+        base = base.rstrip().rstrip('?.').rstrip()
     if len(base) + len(suffix) <= limit:
         return base + suffix
     room = limit - len(suffix)
@@ -221,6 +243,22 @@ def find_stem_and_text(text):
     return None, None
 
 
+# A question numbered as a bare "1.", "2." with no letter prefix at all in the document
+# text (some platforms number questions this way in the doc while the actual raw
+# variable is "Q1", "Q2", etc. -- the "Q" only exists in the data, never in the doc).
+# Tagged with a "#" sentinel here and resolved against the real raw variable stems in
+# parse_questionnaire, rather than guessed blindly -- see resolve_sentinel_stem.
+BARE_NUMBER_RE = re.compile(r'^\(?\s*(\d{1,3})\s*[\.\)](?:\s+(?=\S)|(?=[A-Z(]))(.+)$')
+
+
+def find_bare_number_stem(text):
+    for line in text.split('\n'):
+        m = BARE_NUMBER_RE.match(line.strip())
+        if m:
+            return f"#{m.group(1)}", m.group(2).strip()
+    return None, None
+
+
 def is_intlike(s):
     return bool(re.fullmatch(r'-?\d+', s.strip()))
 
@@ -243,9 +281,53 @@ def classify_row(row):
         if stem:
             return ('header', (stem, text))
 
+    # Word can merge a cell across many underlying grid columns, and python-docx then
+    # reports that cell's text once per column it spans -- so a row can show up with
+    # anywhere from 3 to 30+ raw cells for what is logically a 2- or 8-column row, and
+    # even the lead "item" cell itself may repeat 1-3x before the real content starts.
+    # Dedup (uniq, already order-preserving) is the only reliable read on row shape;
+    # only whether the ORIGINAL first cell was blank still needs the raw list.
+    raw_first_blank = not cells_text[0].strip() if cells_text else True
+    if raw_first_blank:
+        item_label, rest = None, uniq
+    else:
+        item_label = uniq[0] if uniq else ''
+        rest = uniq[1:]
+
+    # A bare programmer note as the row's lead cell (e.g. "#Randomize items") is never
+    # a real item or a real header -- skip the row outright.
+    if item_label and item_label.startswith('#'):
+        return ('skip', None)
+
+    # A pure column-header/legend row for a rating grid: blank lead cell, several
+    # DIFFERENT scale-label words following (e.g. "| | Very good | Good | ... |").
+    # Not an item -- skip it so it doesn't consume a position in the item sequence.
+    if item_label is None and len(set(rest)) > 1 and not any(is_intlike(c) for c in rest):
+        return ('skip', None)
+
+    # A rating-grid ITEM row: the lead cell is the item/statement text, and the rest of
+    # the row is either the scale's real codes (printed once, typically on the row that
+    # doubles as the legend -- several distinct ints) or an identical placeholder glyph
+    # repeated per column (e.g. "○", collapsed by dedup to one remaining value). Either
+    # way this is ONE item, positioned by row order -- not a single (label, code) pair
+    # the way a plain coded option row ("Male | 1") is.
+    if item_label and not is_intlike(item_label) and rest:
+        if len(rest) > 1 and all(is_intlike(c) for c in rest):
+            return ('textonly', item_label)
+        if len(rest) == 1 and not is_intlike(rest[0]):
+            return ('textonly', item_label)
+
     if ints and nonints:
         return ('coded', (nonints[0], int(ints[-1])))
     if nonints and not ints:
+        # Bare-number stems are only checked for a genuine single-cell header row (the
+        # whole row is one spanning cell) -- a real answer-option row like "(1)First___"
+        # paired with a code is already caught by the 'coded' branch above, so this
+        # can't be confused with one.
+        if len(uniq) == 1:
+            stem, text = find_bare_number_stem(uniq[0])
+            if stem:
+                return ('header', (stem, text))
         all_bold = all(cell_is_bold(c) for c in row.cells if c.text.strip())
         return ('caption' if all_bold else 'textonly', nonints[0])
     return ('skip', None)
@@ -266,10 +348,13 @@ def flush(questions, stem, buf):
             questions.setdefault(stem, []).append((clean_text(label), i))
 
 
-def parse_questionnaire(path):
+def parse_questionnaire(path, raw_stems=frozenset()):
     """Returns (questions, question_text):
        questions[stem]      = [(option_label, code), ...] in document order
        question_text[stem]  = the question's own prompt text
+    raw_stems is the set of actual variable stems seen in the raw .sav -- used to
+    resolve bare-number headers ("1.", "2.") to their real stem ("Q1", "Q2") only
+    when that stem is confirmed to exist, rather than guessed.
     """
     doc = Document(path)
     items = list(iter_block_items(doc.element.body))
@@ -277,6 +362,16 @@ def parse_questionnaire(path):
     numbering_counters = {}
     questions, question_text = {}, {}
     current_stem, buf = None, []
+
+    def resolve_sentinel(stem):
+        if not stem or not stem.startswith('#'):
+            return stem
+        n = stem[1:]
+        if f"Q{n}" in raw_stems:
+            return f"Q{n}"
+        if n in raw_stems:
+            return n
+        return None  # no confirmed match in the raw data -- don't guess
 
     def maybe_update_question_text(stem, raw_text):
         # Some questions open with an intro/transition sentence ("I will now ask you
@@ -304,6 +399,9 @@ def parse_questionnaire(path):
             text = it.text.strip()
             if text:
                 stem, rest = find_stem_and_text(text)
+                if not stem:
+                    stem, rest = find_bare_number_stem(text)
+                    stem = resolve_sentinel(stem)
                 if not stem and numbering_map:
                     auto_stem = resolve_auto_number(it, numbering_map, numbering_counters)
                     if auto_stem:
@@ -316,7 +414,10 @@ def parse_questionnaire(path):
             for row in it.rows:
                 kind, payload = classify_row(row)
                 if kind == 'header':
-                    set_stem(*payload)
+                    stem, text = payload
+                    stem = resolve_sentinel(stem)
+                    if stem:
+                        set_stem(stem, text)
                 elif kind in ('coded', 'textonly', 'caption'):
                     buf.append((kind, payload))
     flush(questions, current_stem, buf)
@@ -407,16 +508,108 @@ def item_position(p, family_rules, key):
     return None
 
 
+def resolve_item_label(p, pos, key, fam_size, qcodes_pairs, stem_mismatch, sav_value_label_dict, other_positions):
+    """Figure out the item-specific text (if any) for one grid/flat-family member,
+    without composing or truncating anything -- shared by the family-wide reserve
+    calculation (compute_family_reserve) and rename_and_label, so both agree on
+    exactly what text a sibling will need.
+    Returns (item_label_or_None, is_other_pair, note_or_None). is_other_pair means
+    the caller should compose ' : Others' / ' : Others Specify' directly rather than
+    use item_label (which is None in that case)."""
+    if pos is not None and (key, pos) in other_positions:
+        return None, True, None
+
+    if p['kind'] == 'flat' and stem_mismatch:
+        note = ("questionnaire item count for this question doesn't match the raw data "
+                "— used the raw data's own value labels for the option text instead")
+        item_label = None
+        if sav_value_label_dict:
+            raw_item = sav_value_label_dict.get(pos, sav_value_label_dict.get(float(pos)))
+            item_label = clean_text(raw_item) if raw_item else None
+        if not item_label:
+            note += '; no matching option code in raw data value labels either — label may be incomplete'
+    elif qcodes_pairs and pos is not None and pos <= len(qcodes_pairs):
+        item_label, note = qcodes_pairs[pos - 1][0], None
+    elif qcodes_pairs is None and fam_size > 1:
+        item_label, note = None, 'question stem not found in questionnaire — label may be incomplete'
+    else:
+        item_label, note = None, None
+
+    # An item's own text can itself be a full paragraph (e.g. a long statement to agree
+    # or disagree with). Cap it well under the label limit so the parent question always
+    # keeps a meaningful share of the budget too -- otherwise a single huge item starves
+    # every sibling's parent text down to a near-meaningless fragment (see compose logic
+    # in compute_family_reserve/rename_and_label, which size the parent around this cap).
+    if item_label and len(item_label) > MAX_ITEM_TEXT_CHARS:
+        item_label, _ = truncate_label(item_label, MAX_ITEM_TEXT_CHARS)
+        note = (note + '; ' if note else '') + 'item text itself shortened to fit label limits'
+
+    return item_label, False, note
+
+
+def pick_meaningful_text(text, limit):
+    """When the full text won't fit, prefer dropping whole LEADING sentences over a
+    blind character cut -- the later sentence(s) in a questionnaire prompt are more
+    often the actual question, with earlier ones being scene-setting context (e.g.
+    "Up until <date>, X happened. Given that, would you...?" -- the second sentence
+    alone is usually the meaningful, self-contained ask). Falls back to a plain
+    character truncation only if no sentence-boundary cut fits."""
+    if not text or len(text) <= limit:
+        return text
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    for i in range(1, len(sentences)):
+        candidate = ' '.join(sentences[i:]).strip()
+        if candidate and len(candidate) <= limit:
+            return candidate
+    fallback, _ = truncate_label(text, limit)
+    return fallback
+
+
+def compute_family_reserve(parsed_all, family_rules, questions, flat_mismatch, other_positions, sav_value_labels):
+    """For every stem where more than one raw variable shares it, find the longest
+    ' : {item text}' (or ' : Others' / ' : Others Specify') suffix ANY sibling will
+    need. Used to shorten that stem's shared parent text once, for the worst case --
+    so every sibling in the same question keeps identical text before ' : ', rather
+    than each independently truncating the parent to fit its own item's length."""
+    reserve = defaultdict(int)
+    for p in parsed_all:
+        if p['kind'] == 'plain':
+            continue
+        key = (p['stem'], p['loop'])
+        fam_size = family_rules['fam_size'].get(key, 1)
+        if fam_size <= 1:
+            continue
+        pos = item_position(p, family_rules, key)
+        qcodes_pairs = questions.get(p['stem'])
+        stem_mismatch = p['kind'] == 'flat' and p['stem'] in flat_mismatch
+        sav_value_label_dict = sav_value_labels.get(p['raw'])
+        item_label, is_other_pair, _ = resolve_item_label(
+            p, pos, key, fam_size, qcodes_pairs, stem_mismatch, sav_value_label_dict, other_positions)
+        if is_other_pair:
+            needed = len(" : Others Specify") if p['other'] else len(" : Others")
+        elif item_label:
+            needed = len(f" : {item_label}")
+        else:
+            continue
+        reserve[p['stem']] = max(reserve[p['stem']], needed)
+    return reserve
+
+
 def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_mismatch,
                       sav_value_label_dict, other_positions):
     notes = []
+    recoded = False  # True when a flat position's raw suffix number was mapped to a
+                      # DIFFERENT code (e.g. Q35_7 -> Q35_999) -- the team wants these
+                      # highlighted since it's an actual value change, not just a rename
 
     def finalize(new_name, label):
+        if label:
+            label = label.replace('?', '.')
         label, was_truncated = truncate_label(label)
         if was_truncated:
             notes.append(f'label truncated to {LABEL_CHAR_LIMIT} characters — '
                           'original questionnaire text was longer, please review')
-        return new_name, label, '; '.join(notes)
+        return new_name, label, '; '.join(notes), recoded
 
     if p['raw'].lower() in SYS_VAR_MAP:
         new_name = SYS_VAR_MAP[p['raw'].lower()]
@@ -449,6 +642,7 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_
         if qcodes_pairs and pos <= len(qcodes_pairs) and not stem_mismatch:
             code = qcodes_pairs[pos - 1][1]
             suffix = f"_{code}"
+            recoded = (code != pos)
         else:
             # questionnaire count doesn't line up with the raw file for this stem (or the
             # stem wasn't found at all) -- the doc's row order can't be trusted to derive
@@ -474,29 +668,15 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_
 
     new_name = new_stem + suffix + ('_other' if p['other'] else '')
 
-    # --- label ---
-    # A position that has a "please specify" write-in companion (X_N alongside
-    # X_N_other) is always the catch-all "Others" option, regardless of whatever
-    # exact wording the questionnaire or raw data uses for it ("Any Other",
-    # "Others____", etc.) -- standardize both to "Others" / "Others Specify".
-    if pos is not None and (key, pos) in other_positions:
+    item_label, is_other_pair, item_note = resolve_item_label(
+        p, pos, key, fam_size, qcodes_pairs, stem_mismatch, sav_value_label_dict, other_positions)
+    if item_note:
+        notes.append(item_note)
+
+    if is_other_pair:
         base_label = compose_with_suffix(parent_text, " : Others") if parent_text else "Others"
         label = compose_with_suffix(base_label, " Specify") if p['other'] else base_label
         return finalize(new_name, label)
-
-    item_label = None
-    if p['kind'] == 'flat' and stem_mismatch:
-        notes.append('questionnaire item count for this question doesn\'t match the raw data '
-                      '— used the raw data\'s own value labels for the option text instead')
-        if sav_value_label_dict:
-            raw_item = sav_value_label_dict.get(pos, sav_value_label_dict.get(float(pos)))
-            item_label = clean_text(raw_item) if raw_item else None
-        if not item_label:
-            notes.append('no matching option code in raw data value labels either — label may be incomplete')
-    elif qcodes_pairs and pos is not None and pos <= len(qcodes_pairs):
-        item_label = qcodes_pairs[pos - 1][0]
-    elif qcodes_pairs is None and fam_size > 1:
-        notes.append('question stem not found in questionnaire — label may be incomplete')
 
     if parent_text and item_label and fam_size > 1:
         label = compose_with_suffix(parent_text, f" : {item_label}")
@@ -518,10 +698,15 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_
 # ----------------------------------------------------------------------------
 # 4. Main: read .sav, parse questionnaire, build both sheets
 # ----------------------------------------------------------------------------
-def clean_sav_label(varname, raw_label):
+def clean_sav_label(varname, stem, raw_label):
+    """Strip a leading 'varname - ' or 'stem - ' prefix off a raw .sav variable label.
+    Multi-select family members (Q31_1, Q31_2, ...) commonly all share one label that's
+    prefixed with the STEM ('Q31 - ...'), not the full variable name, so both are tried."""
     if not raw_label:
         return ''
     lbl = re.sub(r'^' + re.escape(varname) + r'\s*-\s*', '', raw_label)
+    if lbl == raw_label and stem and stem != varname:
+        lbl = re.sub(r'^' + re.escape(stem) + r'\s*-\s*', '', raw_label)
     return clean_text(lbl)
 
 
@@ -531,9 +716,10 @@ def build_workbook(sav_path, qnr_path):
     sav_labels = meta.column_names_to_labels
     sav_value_labels = meta.variable_value_labels
 
-    questions, question_text = parse_questionnaire(qnr_path)
-
     parsed_all = [parse_raw(c) for c in raw_cols]
+    raw_stems = {p['stem'] for p in parsed_all}
+    questions, question_text = parse_questionnaire(qnr_path, raw_stems)
+
     family_rules = build_family_rules(parsed_all)
 
     # Detect stems where the questionnaire's option count doesn't match the number of
@@ -561,14 +747,28 @@ def build_workbook(sav_path, qnr_path):
             if pos is not None:
                 other_positions.add((key, pos))
 
+    # Resolve each multi-member stem's parent text ONCE, sized to fit alongside the
+    # longest item any of its siblings will need -- so every sibling shares identical
+    # text before " : ", instead of each independently truncating the parent based on
+    # its own (shorter or longer) item text.
+    reserve = compute_family_reserve(parsed_all, family_rules, questions, flat_mismatch,
+                                      other_positions, sav_value_labels)
+    for stem, needed in reserve.items():
+        if stem in question_text:
+            budget = max(LABEL_CHAR_LIMIT - needed, 20)
+            question_text[stem] = pick_meaningful_text(question_text[stem], budget)
+
     rows = []
     rename_map = {}
+    recoded_rows = set()   # row indices (0-based within `rows`) where a code was recoded
     for p in parsed_all:
-        sav_lbl = clean_sav_label(p['raw'], sav_labels.get(p['raw']))
+        sav_lbl = clean_sav_label(p['raw'], p['stem'], sav_labels.get(p['raw']))
         sav_vl_dict = sav_value_labels.get(p['raw'])
-        new_name, label, notes = rename_and_label(
+        new_name, label, notes, recoded = rename_and_label(
             p, family_rules, questions, question_text, sav_lbl, flat_mismatch,
             sav_vl_dict, other_positions)
+        if recoded:
+            recoded_rows.add(len(rows))
         rows.append([p['raw'], new_name, label, notes])
         rename_map[p['raw']] = new_name
 
@@ -580,8 +780,14 @@ def build_workbook(sav_path, qnr_path):
     ws1.title = 'Variable Label'
     ws1.append(['Variable Information'])
     ws1.append(['Raw Variable', 'Renamed Variable', 'Label', 'Notes'])
-    for r in rows:
+    yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+    header_rows = 2  # 'Variable Information' title row + column-header row, before data starts
+    for i, r in enumerate(rows):
         ws1.append(r)
+        if i in recoded_rows:
+            excel_row = header_rows + i + 1  # openpyxl rows are 1-indexed
+            for col in range(1, 5):
+                ws1.cell(row=excel_row, column=col).fill = yellow_fill
 
     # Value Label sheet intentionally omitted for now -- a different approach for
     # value labels is coming; rename_map is kept above since that logic will need it.
