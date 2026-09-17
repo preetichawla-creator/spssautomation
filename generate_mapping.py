@@ -7,9 +7,10 @@ USAGE
     python generate_mapping.py --sav RawData.sav --qnr questionnaire.docx --out mapping.xlsx
 
 OUTPUT
-    An .xlsx with two sheets:
+    An .xlsx with one sheet:
       - "Variable Label": Raw Variable | Renamed Variable | Label | Notes
-      - "Value Label":    Variable (renamed) | Code | Label
+    (A "Value Label" sheet is intentionally not generated for now -- a different
+    approach for value labels is being worked out separately.)
 
 WHAT THIS DOES AUTOMATICALLY (validated against two real studies)
     - Loop notation:      QM1x1_r1        -> QM1.1
@@ -61,6 +62,64 @@ SYS_VAR_MAP = {
 }
 
 STEM_LINE_RE = re.compile(r'^\**\s*(Q?[A-Za-z]{1,4}\d{1,3}[a-zA-Z]*)\s*[\.\-–:/\s]*(.*)$')
+
+# Unicode blocks for non-Latin scripts commonly used for in-questionnaire translations
+# (Hindi/Devanagari, Urdu/Arabic, and other major Indic scripts). Text in these ranges
+# is stripped out of labels — SPSS variable labels should carry the English question
+# text only, not a bundled translation.
+NON_LATIN_RE = re.compile(
+    r'[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF\u0B00-\u0B7F'
+    r'\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F'
+    r'\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]+'
+)
+
+LABEL_CHAR_LIMIT = 250
+
+
+def clean_text(text):
+    """Strip survey-programming markup (<...>, [%...%]) and any non-Latin-script
+    translation text, then collapse whatever whitespace/punctuation that leaves behind."""
+    if not text:
+        return ''
+    cleaned = re.sub(r'<[^>]*>', '', text)
+    cleaned = re.sub(r'\[%.*?%\]', '', cleaned)
+    cleaned = NON_LATIN_RE.sub('', cleaned)
+    cleaned = re.sub(r'[\(\[]\s*[\)\]]', '', cleaned)          # empty () or [] left behind
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+    # drop trailing whitespace-separated tokens that are pure punctuation — these are
+    # debris left behind where a translation used to sit (e.g. "gender? ?" -> "gender?")
+    tokens = cleaned.split(' ')
+    while tokens and re.fullmatch(r'[^\w]+', tokens[-1] or ''):
+        tokens.pop()
+    cleaned = ' '.join(tokens)
+    return cleaned.strip(' /|-,.')
+
+
+def truncate_label(text, limit=LABEL_CHAR_LIMIT):
+    """Hard cap at `limit` chars, cutting at the last full word so SPSS never
+    receives a label over its variable-label limit. Returns (text, was_truncated)."""
+    if not text or len(text) <= limit:
+        return text, False
+    truncated = text[:limit]
+    if ' ' in truncated:
+        truncated = truncated.rsplit(' ', 1)[0]
+    return truncated.rstrip(' ,.;:-'), True
+
+
+def compose_with_suffix(base, suffix, limit=LABEL_CHAR_LIMIT):
+    """Join base+suffix, shortening `base` (not the suffix) if needed so the
+    item-specific suffix — the part that actually distinguishes this variable
+    from its siblings — always survives, rather than being the first thing lost
+    to truncation."""
+    if len(base) + len(suffix) <= limit:
+        return base + suffix
+    room = limit - len(suffix)
+    if room < 20:
+        # suffix alone is nearly/over the limit -- nothing sensible to reserve for
+        # base, so fall back to plain truncation of the combined string
+        return base + suffix
+    shortened, _ = truncate_label(base, room)
+    return shortened + suffix
 
 
 # ----------------------------------------------------------------------------
@@ -120,22 +179,35 @@ def flush(questions, stem, buf):
     if 'coded' in kinds:
         for k, v in buf:
             if k == 'coded':
-                questions.setdefault(stem, []).append(v)
+                label, code = v
+                questions.setdefault(stem, []).append((clean_text(label), code))
     elif kinds <= {'textonly', 'caption'} and any(k == 'textonly' for k, _ in buf):
         labels = [v for k, v in buf if k == 'textonly']
         for i, label in enumerate(labels, start=1):
-            questions.setdefault(stem, []).append((label, i))
+            questions.setdefault(stem, []).append((clean_text(label), i))
 
 
 def parse_questionnaire(path):
     """Returns (questions, question_text):
        questions[stem]      = [(option_label, code), ...] in document order
-       question_text[stem]  = the question's own prompt text (first line, cleaned)
+       question_text[stem]  = the question's own prompt text
     """
     doc = Document(path)
     items = list(iter_block_items(doc.element.body))
     questions, question_text = {}, {}
     current_stem, buf = None, []
+
+    def maybe_update_question_text(stem, raw_text):
+        # Some questions open with an intro/transition sentence ("I will now ask you
+        # some questions...") before the actual question appears in a later paragraph.
+        # Prefer whichever candidate is actually phrased as a question (has a "?"),
+        # and don't clobber a good one already found with a later non-question line.
+        cleaned = clean_text(raw_text)
+        if not cleaned:
+            return
+        existing = question_text.get(stem)
+        if existing is None or ('?' not in existing and '?' in cleaned):
+            question_text[stem] = cleaned
 
     def set_stem(stem, text):
         nonlocal current_stem, buf
@@ -143,8 +215,8 @@ def parse_questionnaire(path):
             flush(questions, current_stem, buf)
             buf = []
             current_stem = stem
-        if text and stem not in question_text:
-            question_text[stem] = text
+        if text:
+            maybe_update_question_text(stem, text)
 
     for it in items:
         if isinstance(it, Paragraph):
@@ -153,6 +225,8 @@ def parse_questionnaire(path):
                 stem, rest = find_stem_and_text(text)
                 if stem:
                     set_stem(stem, rest)
+                elif current_stem:
+                    maybe_update_question_text(current_stem, text)
         else:
             for row in it.rows:
                 kind, payload = classify_row(row)
@@ -227,25 +301,42 @@ def build_family_rules(parsed_list):
 # ----------------------------------------------------------------------------
 # 3. Rename + label + notes for one variable
 # ----------------------------------------------------------------------------
-def item_position(p):
+def item_position(p, family_rules, key):
     """Which number identifies 'which item in the list' for a positional lookup —
-    the flat suffix, or whichever of row/col varies for a grid item."""
+    the flat suffix, whichever of row/col varies for a grid item, or — for an 'rc'
+    item whose family collapses to a single varying axis (see build_family_rules) —
+    that axis. A genuine two-axis grid (both vary) has no single "position", so no
+    item-specific lookup is attempted there."""
     if p['kind'] == 'flat':
         return p['col']
     if p['kind'] == 'r':
         return p['row']
     if p['kind'] == 'c':
         return p['col']
-    return None  # 'rc' with both varying has no single "position" -> no lookup
+    if p['kind'] == 'rc':
+        rule = family_rules['rc_rule'].get(key)
+        if rule == 'row_only':
+            return p['row']
+        if rule == 'col_only':
+            return p['col']
+    return None
 
 
-def rename_and_label(p, family_rules, questions, question_text, sav_label):
+def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_mismatch,
+                      sav_value_label_dict, other_positions):
     notes = []
+
+    def finalize(new_name, label):
+        label, was_truncated = truncate_label(label)
+        if was_truncated:
+            notes.append(f'label truncated to {LABEL_CHAR_LIMIT} characters — '
+                          'original questionnaire text was longer, please review')
+        return new_name, label, '; '.join(notes)
 
     if p['raw'].lower() in SYS_VAR_MAP:
         new_name = SYS_VAR_MAP[p['raw'].lower()]
         label = sav_label or new_name.replace('_', ' ')
-        return new_name, label, ''
+        return finalize(new_name, label)
 
     new_stem = p['stem'] + (f".{p['loop']}" if p['loop'] else "")
     key = (p['stem'], p['loop'])
@@ -257,23 +348,29 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label):
         label = parent_text or sav_label or new_name
         if not qcodes_pairs and not parent_text:
             notes.append('no rule matched (kept as raw) — likely needs a study-specific name')
-        return new_name, label, '; '.join(notes)
+        return finalize(new_name, label)
 
     fam_size = family_rules['fam_size'].get(key, 1)
-    pos = item_position(p)
+    pos = item_position(p, family_rules, key)
 
     if key in family_rules['composite']:
         notes.append('composite/multi-part question (mixed grid shapes under one stem) — '
                       'rename/label may not match your team\'s convention here, please verify')
 
+    stem_mismatch = p['kind'] == 'flat' and p['stem'] in flat_mismatch
+
     # --- suffix / rename ---
     if p['kind'] == 'flat':
-        if qcodes_pairs and pos <= len(qcodes_pairs):
+        if qcodes_pairs and pos <= len(qcodes_pairs) and not stem_mismatch:
             code = qcodes_pairs[pos - 1][1]
             suffix = f"_{code}"
         else:
+            # questionnaire count doesn't line up with the raw file for this stem (or the
+            # stem wasn't found at all) -- the doc's row order can't be trusted to derive
+            # the right code, so keep the raw suffix as-is rather than risk a wrong one
             suffix = f"_{pos}"
-            notes.append('no questionnaire match for this position — code left as-is, please verify')
+            if not stem_mismatch:
+                notes.append('no questionnaire match for this position — code left as-is, please verify')
     elif fam_size == 1:
         suffix = ''  # sole member of its stem -> index carries no information
     elif p['kind'] == 'r':
@@ -293,14 +390,30 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label):
     new_name = new_stem + suffix + ('_other' if p['other'] else '')
 
     # --- label ---
+    # A position that has a "please specify" write-in companion (X_N alongside
+    # X_N_other) is always the catch-all "Others" option, regardless of whatever
+    # exact wording the questionnaire or raw data uses for it ("Any Other",
+    # "Others____", etc.) -- standardize both to "Others" / "Others Specify".
+    if pos is not None and (key, pos) in other_positions:
+        base_label = compose_with_suffix(parent_text, " : Others") if parent_text else "Others"
+        label = compose_with_suffix(base_label, " Specify") if p['other'] else base_label
+        return finalize(new_name, label)
+
     item_label = None
-    if qcodes_pairs and pos is not None and pos <= len(qcodes_pairs):
+    if p['kind'] == 'flat' and stem_mismatch:
+        notes.append('questionnaire item count for this question doesn\'t match the raw data '
+                      '— used the raw data\'s own value labels for the option text instead')
+        if sav_value_label_dict:
+            item_label = sav_value_label_dict.get(pos, sav_value_label_dict.get(float(pos)))
+        if item_label is None:
+            notes.append('no matching option code in raw data value labels either — label may be incomplete')
+    elif qcodes_pairs and pos is not None and pos <= len(qcodes_pairs):
         item_label = qcodes_pairs[pos - 1][0]
     elif qcodes_pairs is None and fam_size > 1:
         notes.append('question stem not found in questionnaire — label may be incomplete')
 
     if parent_text and item_label and fam_size > 1:
-        label = f"{parent_text} :: {item_label}"
+        label = compose_with_suffix(parent_text, f" : {item_label}")
     elif parent_text:
         label = parent_text
     elif item_label:
@@ -309,9 +422,11 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label):
         label = sav_label or new_name
 
     if p['other']:
-        label = f"{label} :: Others"
+        # no detected non-other sibling at this position (rare -- e.g. a genuine two-axis
+        # grid item) -- fall back to the old plain-append behavior rather than dropping it
+        label = compose_with_suffix(label, " : Others")
 
-    return new_name, label, '; '.join(notes)
+    return finalize(new_name, label)
 
 
 # ----------------------------------------------------------------------------
@@ -321,8 +436,7 @@ def clean_sav_label(varname, raw_label):
     if not raw_label:
         return ''
     lbl = re.sub(r'^' + re.escape(varname) + r'\s*-\s*', '', raw_label)
-    lbl = re.sub(r'\[%.*?%\]', '', lbl).strip()
-    return lbl
+    return clean_text(lbl)
 
 
 def build_workbook(sav_path, qnr_path):
@@ -336,13 +450,43 @@ def build_workbook(sav_path, qnr_path):
     parsed_all = [parse_raw(c) for c in raw_cols]
     family_rules = build_family_rules(parsed_all)
 
+    # Detect stems where the questionnaire's option count doesn't match the number of
+    # raw flat-family variables actually in the data -- positional matching can't be
+    # trusted for these, so labeling (and renaming) falls back to the raw data's own
+    # value labels instead (see rename_and_label).
+    flat_positions = defaultdict(set)
+    for p in parsed_all:
+        if p['kind'] == 'flat':
+            flat_positions[p['stem']].add(p['col'])
+    # Mismatch = the questionnaire codebook can't cover every position actually used in
+    # the raw file for this stem (missing entirely, or too short) -- NOT simply "different
+    # counts", since a lone _other companion variable legitimately represents just one
+    # high-numbered position out of a longer response list and that's not an error.
+    flat_mismatch = {stem for stem, positions in flat_positions.items()
+                      if len(questions.get(stem, [])) < max(positions)}
+
+    # Positions that have a "please specify" write-in companion (X_N + X_N_other) --
+    # these are always the catch-all "Others" option; see rename_and_label.
+    other_positions = set()
+    for p in parsed_all:
+        if p['other']:
+            key = (p['stem'], p['loop'])
+            pos = item_position(p, family_rules, key)
+            if pos is not None:
+                other_positions.add((key, pos))
+
     rows = []
     rename_map = {}
     for p in parsed_all:
         sav_lbl = clean_sav_label(p['raw'], sav_labels.get(p['raw']))
-        new_name, label, notes = rename_and_label(p, family_rules, questions, question_text, sav_lbl)
-        rows.append((p['raw'], new_name, label, notes))
+        sav_vl_dict = sav_value_labels.get(p['raw'])
+        new_name, label, notes = rename_and_label(
+            p, family_rules, questions, question_text, sav_lbl, flat_mismatch,
+            sav_vl_dict, other_positions)
+        rows.append([p['raw'], new_name, label, notes])
         rename_map[p['raw']] = new_name
+
+    _flag_duplicates(rows)
 
     wb = Workbook()
 
@@ -351,22 +495,33 @@ def build_workbook(sav_path, qnr_path):
     ws1.append(['Variable Information'])
     ws1.append(['Raw Variable', 'Renamed Variable', 'Label', 'Notes'])
     for r in rows:
-        ws1.append(list(r))
+        ws1.append(r)
 
-    ws2 = wb.create_sheet('Value Label')
-    ws2.append(['Variable Values'])
-    ws2.append(['Variable', 'Code', 'Label'])
-    for raw_name in raw_cols:
-        vl = sav_value_labels.get(raw_name)
-        if not vl:
-            continue
-        new_name = rename_map[raw_name]
-        first = True
-        for code, label in vl.items():
-            ws2.append([new_name if first else None, code, label])
-            first = False
+    # Value Label sheet intentionally omitted for now -- a different approach for
+    # value labels is coming; rename_map is kept above since that logic will need it.
 
     return wb
+
+
+def _flag_duplicates(rows):
+    """Post-pass over the built rows (raw, renamed, label, notes): flag any renamed
+    variable name or label that isn't unique, so nothing silently collides once this
+    hits SPSS. Mutates each row's notes (index 3) in place."""
+    from collections import Counter
+
+    name_counts = Counter(r[1] for r in rows)
+    label_counts = Counter(r[2] for r in rows if r[2])
+
+    for r in rows:
+        extra = []
+        if name_counts[r[1]] > 1:
+            extra.append(f'DUPLICATE renamed variable name (shared by {name_counts[r[1]]} '
+                          'variables) — must be resolved before use in SPSS')
+        if r[2] and label_counts[r[2]] > 1:
+            extra.append(f'duplicate label (same text as {label_counts[r[2]] - 1} other '
+                          'variable(s)) — please verify')
+        if extra:
+            r[3] = '; '.join([r[3]] + extra) if r[3] else '; '.join(extra)
 
 
 def main():

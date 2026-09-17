@@ -23,7 +23,7 @@ st.set_page_config(page_title="SPSS Mapping File Generator", layout="wide")
 st.title("SPSS Mapping File Generator")
 st.caption(
     "Upload a raw .sav data file and the Word questionnaire for the same study "
-    "to get a draft Variable Label / Value Label mapping file."
+    "to get a draft Variable Label mapping file."
 )
 
 col1, col2 = st.columns(2)
@@ -88,9 +88,3 @@ if st.session_state.get("mapping_ready"):
 
     with tab2:
         st.dataframe(df, width="stretch", height=500)
-
-    with st.expander("Value Label sheet preview"):
-        ws2 = wb_preview["Value Label"]
-        rows2 = list(ws2.iter_rows(values_only=True))
-        df2 = pd.DataFrame(rows2[2:], columns=rows2[1])
-        st.dataframe(df2, width="stretch", height=400)
