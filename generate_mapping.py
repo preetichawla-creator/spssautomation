@@ -42,6 +42,7 @@ second seller-survey study — see chat history for the worked examples.
 """
 import argparse
 import re
+import zipfile
 from collections import defaultdict
 
 import pyreadstat
@@ -122,6 +123,65 @@ def compose_with_suffix(base, suffix, limit=LABEL_CHAR_LIMIT):
     return shortened + suffix
 
 
+def load_numbering_map(docx_path):
+    """Word can auto-number headings via a List style (numPr) instead of the number
+    being literal text in the paragraph -- python-docx doesn't resolve these, so this
+    reads word/numbering.xml directly. Returns {numId: (prefix, start)} for every
+    simple single-level, decimal, "<prefix>%1<suffix>" numbering definition (e.g.
+    lvlText "A%1." -> prefix "A"), which is what auto-numbered question stems like
+    "A3.", "C5." turn out to be in practice. Anything more complex (multi-level,
+    non-decimal, roman numerals, etc.) is left alone rather than guessed at."""
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            if 'word/numbering.xml' not in z.namelist():
+                return {}
+            content = z.read('word/numbering.xml').decode('utf-8', errors='ignore')
+    except Exception:
+        return {}
+
+    abstract_fmt = {}
+    for m in re.finditer(r'<w:abstractNum w:abstractNumId="(\d+)".*?</w:abstractNum>', content, re.S):
+        aid, block = m.group(1), m.group(0)
+        lvl0 = re.search(r'<w:lvl w:ilvl="0">.*?</w:lvl>', block, re.S)
+        if not lvl0:
+            continue
+        lvltext_m = re.search(r'w:lvlText w:val="([^"]*)"', lvl0.group(0))
+        start_m = re.search(r'w:start w:val="(\d+)"', lvl0.group(0))
+        fmt_m = re.search(r'w:numFmt w:val="([^"]*)"', lvl0.group(0))
+        if not lvltext_m or not fmt_m or fmt_m.group(1) != 'decimal':
+            continue
+        prefix_m = re.match(r'^([^%]*)%1[^%]*$', lvltext_m.group(1))
+        if not prefix_m or not prefix_m.group(1):
+            continue  # no literal prefix before the counter -> not a "letter+number" stem
+        abstract_fmt[aid] = (prefix_m.group(1), int(start_m.group(1)) if start_m else 1)
+
+    num_map = {}
+    for m in re.finditer(r'<w:num w:numId="(\d+)"[^>]*>\s*<w:abstractNumId w:val="(\d+)"/>', content):
+        num_id, abs_id = m.group(1), m.group(2)
+        if abs_id in abstract_fmt:
+            num_map[num_id] = abstract_fmt[abs_id]
+    return num_map
+
+
+def resolve_auto_number(paragraph, numbering_map, counters):
+    """If this paragraph is auto-numbered by one of the simple letter-series lists
+    load_numbering_map found, return (stem, was_new) advancing that list's counter;
+    otherwise None. ilvl must be 0 -- sub-levels of a multi-level list aren't a
+    single letter+number stem and aren't handled here."""
+    pPr = paragraph._p.pPr
+    if pPr is None or pPr.numPr is None or pPr.numPr.numId is None:
+        return None
+    ilvl = pPr.numPr.ilvl.val if pPr.numPr.ilvl is not None else 0
+    if ilvl != 0:
+        return None
+    num_id = str(pPr.numPr.numId.val)
+    if num_id not in numbering_map:
+        return None
+    prefix, start = numbering_map[num_id]
+    counters[num_id] = counters.get(num_id, start - 1) + 1
+    return f"{prefix}{counters[num_id]}"
+
+
 # ----------------------------------------------------------------------------
 # 1. Questionnaire parsing: build, per question stem, an ordered codebook
 #    [(option_label, code), ...] plus the question's own prompt text.
@@ -194,6 +254,8 @@ def parse_questionnaire(path):
     """
     doc = Document(path)
     items = list(iter_block_items(doc.element.body))
+    numbering_map = load_numbering_map(path)
+    numbering_counters = {}
     questions, question_text = {}, {}
     current_stem, buf = None, []
 
@@ -223,6 +285,10 @@ def parse_questionnaire(path):
             text = it.text.strip()
             if text:
                 stem, rest = find_stem_and_text(text)
+                if not stem and numbering_map:
+                    auto_stem = resolve_auto_number(it, numbering_map, numbering_counters)
+                    if auto_stem:
+                        stem, rest = auto_stem, text
                 if stem:
                     set_stem(stem, rest)
                 elif current_stem:
@@ -404,8 +470,9 @@ def rename_and_label(p, family_rules, questions, question_text, sav_label, flat_
         notes.append('questionnaire item count for this question doesn\'t match the raw data '
                       '— used the raw data\'s own value labels for the option text instead')
         if sav_value_label_dict:
-            item_label = sav_value_label_dict.get(pos, sav_value_label_dict.get(float(pos)))
-        if item_label is None:
+            raw_item = sav_value_label_dict.get(pos, sav_value_label_dict.get(float(pos)))
+            item_label = clean_text(raw_item) if raw_item else None
+        if not item_label:
             notes.append('no matching option code in raw data value labels either — label may be incomplete')
     elif qcodes_pairs and pos is not None and pos <= len(qcodes_pairs):
         item_label = qcodes_pairs[pos - 1][0]
